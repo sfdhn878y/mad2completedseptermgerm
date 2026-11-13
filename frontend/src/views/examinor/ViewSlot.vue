@@ -25,7 +25,7 @@
                     <td><input v-if="editing_id === slot.id" type="date" v-model="form.slot_date"><span v-else>{{ slot.slot_date }}</span></td>
                     <td><input v-if="editing_id === slot.id" type="time" v-model="form.slot_time"><span v-else>{{ slot.slot_time }}</span></td>
                     <td><input v-if="editing_id === slot.id" type="time" v-model="form.end_time"><span v-else>{{ slot.end_time }}</span></td>
-                    <td><input v-if="editing_id === slot.id" type="number" v-model="form.capacity"><span v-else>{{ slot.capacity }}</span></td>
+                    <td>1</td>
                     <td>{{ slot.available }}</td>
                     <td>{{ slot.status }}</td>
                     <td><input v-if="editing_id === slot.id" v-model="form.meeting_link"><span v-else>{{ slot.meeting_link }}</span></td>

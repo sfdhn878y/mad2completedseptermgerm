@@ -1,17 +1,36 @@
+
+import csv
 import jwt
-from flask import Flask, jsonify,request
+import os
+from datetime import datetime
+from celery import Celery
+from flask import Flask, jsonify, request, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-
-
-
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'exam-portal-secret'
 db = SQLAlchemy(app)
+from flask_caching import Cache
 CORS(app)
-
+app.config['CACHE_TYPE'] = 'RedisCache'
+app.config['CACHE_REDIS_URL'] = 'redis://localhost:6379/1'
+cache = Cache(app)
+def make_celery(app):
+    celery_app = Celery(
+        app.import_name,
+        broker='redis://localhost:6379/0',
+        backend='redis://localhost:6379/0'
+    )
+    celery_app.conf.update(app.config)
+    class ContextTask(celery_app.Task):
+        def __call__(self, *args, **kwargs):
+            with app.app_context():
+                return self.run(*args, **kwargs)
+    celery_app.Task = ContextTask
+    return celery_app
+celery = make_celery(app)
 
 class User(db.Model):
     id = db.Column(db.Integer,primary_key=True)
@@ -119,8 +138,143 @@ class Evaluation(db.Model):
     evaluation_date = db.Column(db.String(30), nullable=False, default='')
     status = db.Column(db.String(30), nullable=False, default='Submitted')
 
+class ExportJob(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='pending')
+    file_name = db.Column(db.String(200), nullable=False, default='')
+    message = db.Column(db.String(300), nullable=False, default='')
+    created_at = db.Column(db.String(30), nullable=False, default='')
+
+class Alert(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    message = db.Column(db.String(300), nullable=False)
+    is_read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.String(30), nullable=False, default='')
 
 
+
+
+
+EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'exports')
+CSV_FIELDS = [
+    'Student ID',
+    'Examination Name',
+    'Course',
+    'Examination Date',
+    'Examiner',
+    'Marks Obtained',
+    'Booking Status'
+]
+
+
+def examination_history_rows(user_id):
+    rows = []
+    for booking in Booking.query.filter_by(user_id=user_id).all():
+        slot = Slot.query.filter_by(id=booking.slot_id).first()
+        exam = Exam.query.filter_by(id=slot.exam_id).first() if slot else None
+        course = Course.query.filter_by(id=exam.course_id).first() if exam else None
+        examiner_id = booking.assigned_examinor_id
+        if not examiner_id and slot:
+            examiner_id = slot.examinor_id
+        if not examiner_id and exam:
+            examiner_id = exam.examinor_id
+        examiner = User.query.filter_by(id=examiner_id).first() if examiner_id else None
+        evaluation = Evaluation.query.filter_by(booking_id=booking.id).first()
+        rows.append({
+            'Student ID': user_id,
+            'Examination Name': exam.exam_name if exam else '',
+            'Course': course.coures_name if course else '',
+            'Examination Date': slot.slot_date if slot else '',
+            'Examiner': examiner.name if examiner else '',
+            'Marks Obtained': evaluation.total_marks if evaluation else '',
+            'Booking Status': booking.status
+        })
+    return rows
+
+@celery.task(name='app.export_examination_history_job')
+def export_examination_history_job(job_id, user_id):
+    job = ExportJob.query.filter_by(id=job_id).first()
+    try:
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        file_name = 'examination_history_' + str(user_id) + '_' + str(job_id) + '.csv'
+        path = os.path.join(EXPORT_DIR, file_name)
+        with open(path, 'w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(examination_history_rows(user_id))
+        job.status = 'completed'
+        job.file_name = file_name
+        job.message = 'Examination history CSV is ready'
+        alert = Alert(
+            user_id=user_id,
+            message='Your examination history export is ready. Download the CSV from the dashboard.',
+            created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        )
+        db.session.add(alert)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        job = ExportJob.query.filter_by(id=job_id).first()
+        if job:
+            job.status = 'failed'
+            job.message = 'Export failed'
+        db.session.add(Alert(
+            user_id=user_id,
+            message='Examination history export failed.',
+            created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ))
+        db.session.commit()
+
+
+@app.route('/export_examination_history', methods=['POST'])
+def export_examination_history():
+    data = request.json
+    user = User.query.filter_by(id=data['user_id']).first()
+    if not user or user.role != 'user':
+        return jsonify({'message': 'Only a student can export examination history'})
+    job = ExportJob(
+        user_id=user.id,
+        status='pending',
+        message='Export started',
+        created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    )
+    db.session.add(job)
+    db.session.commit()
+    export_examination_history_job.delay(job.id, user.id)
+    return jsonify({
+        'message': 'Export started. You will get an alert when the CSV is ready.',
+        'job_id': job.id
+    })
+
+
+
+@app.route('/export_job_status', methods=['POST'])
+def export_job_status():
+    data = request.json
+    job = ExportJob.query.filter_by(id=data['job_id'], user_id=data['user_id']).first()
+    if not job:
+        return jsonify({'message': 'Export not found'})
+    return jsonify({
+        'status': job.status,
+        'message': job.message,
+        'file_name': job.file_name,
+        'job_id': job.id
+    })
+
+@app.route('/my_alerts', methods=['POST'])
+def my_alerts():
+    data = request.json
+    alerts = []
+    for alert in Alert.query.filter_by(user_id=data['user_id']).order_by(Alert.id.desc()).all():
+        alerts.append({
+            'id': alert.id,
+            'message': alert.message,
+            'created_at': alert.created_at,
+            'is_read': alert.is_read
+        })
+    return jsonify({'data': alerts})
 
 @app.route('/register',methods=['POST'])
 def register():
@@ -243,6 +397,20 @@ def edit_course(id):
 
 
 from datetime import date, time
+
+def exam_is_finished(exam):
+    if not exam:
+        return False
+    if exam.status == 'Completed':
+        return True
+    if not exam.exam_end_date:
+        return False
+    try:
+        exam_end = date.fromisoformat(str(exam.exam_end_date)[:10])
+    except ValueError:
+        return False
+    return date.today() > exam_end
+
 @app.route('/create_exam', methods=['POST'])
 def create_exam():
     data = request.json
@@ -297,6 +465,9 @@ def create_examinor_profile():
 def examinor_register():
     data = request.json
     print(data)
+    old_user = User.query.filter_by(email=data['email']).first()
+    if old_user:
+        return jsonify({'message': 'Examinor already exists'})
     new_examinor = User(name=data['username'], email=data['email'], password=data['password'], role='examinor')
     db.session.add(new_examinor)
     db.session.commit()
@@ -414,6 +585,9 @@ def admin_exam_detail(exam_id):
 
 @app.route('/create_questionbank/<int:exam_id>',methods=['POST'])
 def create_questionbank(exam_id):
+    exam = Exam.query.filter_by(id=exam_id).first()
+    if exam_is_finished(exam):
+        return jsonify({'message': 'Questions cannot be edited after the exam is finished'})
     data = request.json
     print(data)
     new_question = Question(
@@ -442,17 +616,23 @@ def provide_rubric_details(exam_id):
         })
     return jsonify({
         'data': rubric_list,
-        'exam_name': exam.exam_name if exam else ''
+        'exam_name': exam.exam_name if exam else '',
+        'exam_end_date': exam.exam_end_date if exam else '',
+        'status': exam.status if exam else '',
+        'can_edit': not exam_is_finished(exam)
     })
 
 @app.route('/create_rubric/<int:exam_id>', methods=['POST'])
 def create_rubric(exam_id):
+    exam = Exam.query.filter_by(id=exam_id).first()
+    if exam_is_finished(exam):
+        return jsonify({'message': 'Questions cannot be edited after the exam is finished'})
     data = request.json
     new_question = Question(
         question=data['criterion'],
         description=data['description'],
         marks=data['marks'],
-        weightage=data['weightage'],
+        weightage=data.get('weightage', 0),
         exam_id=exam_id
     )
     db.session.add(new_question)
@@ -463,16 +643,22 @@ def create_rubric(exam_id):
 def edit_rubric(id):
     data = request.json
     question = Question.query.filter_by(id=id).first()
+    exam = Exam.query.filter_by(id=question.exam_id).first()
+    if exam_is_finished(exam):
+        return jsonify({'message': 'Questions cannot be edited after the exam is finished'})
     question.question = data['criterion']
     question.description = data['description']
     question.marks = data['marks']
-    question.weightage = data['weightage']
+    question.weightage = data.get('weightage', 0)
     db.session.commit()
     return jsonify({'message': 'Rubric updated successfully'})
 
 @app.route('/delete_rubric/<int:id>', methods=['POST'])
 def delete_rubric(id):
     question = Question.query.filter_by(id=id).first()
+    exam = Exam.query.filter_by(id=question.exam_id).first()
+    if exam_is_finished(exam):
+        return jsonify({'message': 'Questions cannot be edited after the exam is finished'})
     Mark.query.filter_by(question_id=id).delete()
     db.session.delete(question)
     db.session.commit()
@@ -489,20 +675,21 @@ def create_slot(exam_id):
     slot_start = date.fromisoformat(str(exam.examinor_slot_create_start_date)[:10])
     slot_end = date.fromisoformat(str(exam.examinor_slot_create_end_date)[:10])
     in_window = slot_start <= today <= slot_end
-    if not in_window and not exam.slot_open:
+    opened_by_admin = exam.slot_open or exam.status == 'Slot Creation'
+    if not in_window and not opened_by_admin:
         return jsonify({'message': 'You can only create a slot between the slot start date and the slot end date'})
 
     slot_date = date.fromisoformat(str(data['slot_date'])[:10])
     exam_start = date.fromisoformat(str(exam.exam_start_date)[:10])
     exam_end = date.fromisoformat(str(exam.exam_end_date)[:10])
     if slot_date < exam_start or slot_date > exam_end:
-        return jsonify({'message': 'Slot date must be between the exam start date and the exam end date'})
+        return jsonify({'message': 'Give the slot on an examination date, from the exam start date to the exam end date'})
 
     new_slot = Slot(
         slot_date=data['slot_date'],
         slot_time=data['slot_time'],
         end_time=data['end_time'],
-        capacity=data['capacity'],
+        capacity=1,
         meeting_link=data['meeting_link'],
         status='Available',
         exam_id=exam_id,
@@ -667,12 +854,9 @@ def book_slot(slot_id):
     today = date.today().isoformat()
     if exam.status == 'Closed' or exam.status == 'Completed':
         return jsonify({'message': 'Booking is closed'})
-    if exam.booking_open:
-        if today > exam.booking_end_time:
-            return jsonify({'message': 'Booking is closed'})
-    else:
-        if today < exam.booking_start_time or today > exam.booking_end_time:
-            return jsonify({'message': 'Booking is closed'})
+    opened_by_admin = exam.booking_open or exam.status == 'Booking Open'
+    if not opened_by_admin and (today < exam.booking_start_time or today > exam.booking_end_time):
+        return jsonify({'message': 'Booking is closed'})
     old_booking = Booking.query.filter_by(slot_id=slot_id, user_id=data['user_id'], status='Booked').first()
     if old_booking:
         return jsonify({'message': 'Slot already booked'})
@@ -699,8 +883,8 @@ def exam_detail(exam_id):
     today = date.today().isoformat()
     if exam.status == 'Closed' or exam.status == 'Completed':
         booking_open = False
-    elif exam.booking_open:
-        booking_open = today <= exam.booking_end_time
+    elif exam.booking_open or exam.status == 'Booking Open':
+        booking_open = True
     else:
         booking_open = exam.booking_start_time <= today <= exam.booking_end_time
     slots = []
@@ -746,7 +930,10 @@ def cancel_slot(slot_id):
     slot = Slot.query.filter_by(id=slot_id).first()
     exam = Exam.query.filter_by(id=slot.exam_id).first()
     today = date.today().isoformat()
-    if exam.status == 'Closed' or exam.status == 'Completed' or today > exam.booking_end_time:
+    opened_by_admin = exam.booking_open or exam.status == 'Booking Open'
+    if exam.status == 'Closed' or exam.status == 'Completed':
+        return jsonify({'message': 'Booking period is closed'})
+    if not opened_by_admin and (today < exam.booking_start_time or today > exam.booking_end_time):
         return jsonify({'message': 'Booking period is closed'})
     booking = Booking.query.filter_by(slot_id=slot_id, user_id=data['user_id'], status='Booked').first()
     if not booking:
@@ -772,8 +959,8 @@ def my_booking():
         evaluation = Evaluation.query.filter_by(booking_id=booking.id).first()
         booking_open = False
         if exam and exam.status != 'Closed' and exam.status != 'Completed':
-            if exam.booking_open:
-                booking_open = today <= exam.booking_end_time
+            if exam.booking_open or exam.status == 'Booking Open':
+                booking_open = True
             else:
                 booking_open = exam.booking_start_time <= today <= exam.booking_end_time
         booking_list.append({
@@ -879,7 +1066,10 @@ def give_marks(booking_id):
 
 
 @app.route('/provide_admin_stats', methods=['POST', 'GET'])
+@cache.cached(timeout=60)
 def provide_admin_stats():
+    print("Fetching data from DATABASE")
+
     return jsonify({'data': {
         'courses': Course.query.count(),
         'exams': Exam.query.count(),
@@ -907,6 +1097,13 @@ def edit_exam(exam_id):
     exam.course_id = data['course_id']
     exam.examinor_id = data['examinor_id']
     exam.status = data['status']
+    if data['status'] == 'Slot Creation':
+        exam.slot_open = True
+    elif data['status'] == 'Booking Open':
+        exam.booking_open = True
+    elif data['status'] in ('Draft', 'Closed', 'Completed'):
+        exam.slot_open = False
+        exam.booking_open = False
     db.session.commit()
     return jsonify({'message': 'Examination updated successfully'})
 
@@ -980,7 +1177,7 @@ def update_slot(slot_id):
     slot.slot_date = data['slot_date']
     slot.slot_time = data['slot_time']
     slot.end_time = data['end_time']
-    slot.capacity = data['capacity']
+    slot.capacity = 1
     slot.meeting_link = data['meeting_link']
     db.session.commit()
     return jsonify({'message': 'Slot updated successfully'})
@@ -1002,13 +1199,51 @@ def delete_slot(slot_id):
     db.session.commit()
     return jsonify({'message': 'Slot removed successfully'})
 
+def clock_minutes(value):
+    text = str(value or '')[:5]
+    parts = text.split(':')
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    return int(parts[0]) * 60 + int(parts[1])
+
+def slot_time_range(start_value, end_value, duration):
+    start = clock_minutes(start_value)
+    end = clock_minutes(end_value)
+    if start is not None and end is None:
+        end = start + int(duration or 30)
+    return start, end
+
+def times_overlap(start_a, end_a, start_b, end_b):
+    if None in (start_a, end_a, start_b, end_b):
+        return start_a is not None and start_a == start_b
+    return start_a < end_b and start_b < end_a
+
 @app.route('/reschedule_slot/<int:slot_id>', methods=['POST'])
 def reschedule_slot(slot_id):
     data = request.json
     slot = Slot.query.filter_by(id=slot_id).first()
-    slot.slot_date = data['slot_date']
+    if not slot:
+        return jsonify({'message': 'Slot not found'})
+    exam = Exam.query.filter_by(id=slot.exam_id).first()
+    slot_date = date.fromisoformat(str(data['slot_date'])[:10])
+    exam_start = date.fromisoformat(str(exam.exam_start_date)[:10])
+    exam_end = date.fromisoformat(str(exam.exam_end_date)[:10])
+    if slot_date < exam_start or slot_date > exam_end:
+        return jsonify({'message': 'Reschedule only on an exam date, from the exam start date to the exam end date'})
+    new_start, new_end = slot_time_range(data['slot_time'], data.get('end_time') or slot.end_time, exam.duration)
+    if new_start is None or new_end is None or new_end <= new_start:
+        return jsonify({'message': 'Choose a free time on the exam date'})
+    for other in Slot.query.filter_by(exam_id=slot.exam_id).all():
+        if other.id == slot.id or other.status == 'Cancelled':
+            continue
+        if str(other.slot_date)[:10] != str(data['slot_date'])[:10]:
+            continue
+        other_start, other_end = slot_time_range(other.slot_time, other.end_time, exam.duration)
+        if times_overlap(new_start, new_end, other_start, other_end):
+            return jsonify({'message': 'That time is not free. Choose a free time on the exam date'})
+    slot.slot_date = str(data['slot_date'])[:10]
     slot.slot_time = data['slot_time']
-    slot.end_time = data['end_time']
+    slot.end_time = data.get('end_time') or slot.end_time
     db.session.commit()
     return jsonify({'message': 'Slot rescheduled successfully'})
 
@@ -1068,6 +1303,8 @@ def all_bookings():
             'slot_date': slot.slot_date if slot else '',
             'slot_time': slot.slot_time if slot else '',
             'end_time': slot.end_time if slot else '',
+            'exam_start_date': str(exam.exam_start_date)[:10] if exam else '',
+            'exam_end_date': str(exam.exam_end_date)[:10] if exam else '',
             'status': booking.status,
             'booking_date': booking.booking_date,
             'examinor_id': examinor_id,
@@ -1147,6 +1384,7 @@ def reports():
     }})
 
 @app.route('/examinor_stats', methods=['POST'])
+@cache.cached(timeout=60)
 def examinor_stats():
     data = request.json
     examinor_id = str(data['examinor_id'])
@@ -1244,9 +1482,9 @@ def student_dashboard():
             continue
         open_now = False
         if exam.status != 'Closed' and exam.status != 'Completed':
-            if exam.booking_open and today <= exam.booking_end_time:
+            if exam.booking_open or exam.status == 'Booking Open':
                 open_now = True
-            if not exam.booking_open and exam.booking_start_time <= today <= exam.booking_end_time:
+            elif exam.booking_start_time <= today <= exam.booking_end_time:
                 open_now = True
         taken = Booking.query.filter(Booking.slot_id == slot.id, Booking.status != 'Cancelled').count()
         if open_now and taken < slot.capacity:
@@ -1257,6 +1495,7 @@ def student_dashboard():
     upcoming = 0
     booked = 0
     results = 0
+    examinations = []
     for booking in Booking.query.filter_by(user_id=data['user_id']).all():
         if booking.status == 'Cancelled':
             continue
@@ -1268,9 +1507,18 @@ def student_dashboard():
                 upcoming = upcoming + 1
         if exam and exam.results_published:
             results = results + 1
+        if slot and exam and booking.status == 'Booked':
+            examinations.append({
+                'id': booking.id,
+                'name': exam.exam_name,
+                'slot_date': slot.slot_date,
+                'slot_time': slot.slot_time,
+                'meeting_link': slot.meeting_link
+            })
     return jsonify({'data': {
         'available_exams': available_exams,
         'available_slots': available_slots,
+        'examinations': examinations,
         'upcoming': upcoming,
         'booked': booked,
         'results': results
@@ -1307,84 +1555,19 @@ def my_results():
             'rubrics': rubrics
         })
     return jsonify({'data': results})
-
+@app.route('/download_examination_history/<int:job_id>', methods=['GET'])
+def download_examination_history(job_id):
+    job = ExportJob.query.filter_by(id=job_id, user_id=request.args.get('user_id')).first()
+    if not job or job.status != 'completed' or not job.file_name:
+        return jsonify({'message': 'Export file is not ready'})
+    path = os.path.join(EXPORT_DIR, job.file_name)
+    if not os.path.isfile(path):
+        return jsonify({'message': 'Export file is missing'})
+    return send_file(path, as_attachment=True, download_name=job.file_name)
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        question_columns = [row[1] for row in db.session.execute(db.text('PRAGMA table_info(question)')).fetchall()]
-        if question_columns and 'description' not in question_columns:
-            db.session.execute(db.text("ALTER TABLE question ADD COLUMN description VARCHAR(200) DEFAULT ''"))
-            db.session.commit()
-        rubric_table = db.session.execute(db.text("SELECT name FROM sqlite_master WHERE type='table' AND name='rubric'")).fetchone()
-        if rubric_table:
-            rubric_rows = db.session.execute(db.text('SELECT criterion, description, marks, exam_id FROM rubric')).fetchall()
-            for criterion, description, marks, exam_id in rubric_rows:
-                exists = Question.query.filter_by(exam_id=exam_id, question=criterion, description=description, marks=marks).first()
-                if not exists:
-                    db.session.add(Question(question=criterion, description=description, marks=marks, exam_id=exam_id))
-            db.session.commit()
-        mark_columns = [row[1] for row in db.session.execute(db.text('PRAGMA table_info(mark)')).fetchall()]
-        if mark_columns and 'question_id' not in mark_columns:
-            db.session.execute(db.text('DROP TABLE mark'))
-            db.session.commit()
-            db.create_all()
-        exam_columns = [row[1] for row in db.session.execute(db.text('PRAGMA table_info(exam)')).fetchall()]
-        if 'slot_open' not in exam_columns:
-            db.session.execute(db.text('ALTER TABLE exam ADD COLUMN slot_open BOOLEAN DEFAULT 0'))
-            db.session.commit()
-        if 'exam_type' not in exam_columns:
-            db.session.execute(db.text("ALTER TABLE exam ADD COLUMN exam_type VARCHAR(50) DEFAULT 'Viva'"))
-            db.session.commit()
-        if 'duration' not in exam_columns:
-            db.session.execute(db.text('ALTER TABLE exam ADD COLUMN duration INTEGER DEFAULT 30'))
-            db.session.commit()
-        if 'max_marks' not in exam_columns:
-            db.session.execute(db.text('ALTER TABLE exam ADD COLUMN max_marks INTEGER DEFAULT 100'))
-            db.session.commit()
-        if 'booking_open' not in exam_columns:
-            db.session.execute(db.text('ALTER TABLE exam ADD COLUMN booking_open BOOLEAN DEFAULT 0'))
-            db.session.commit()
-        if 'results_published' not in exam_columns:
-            db.session.execute(db.text('ALTER TABLE exam ADD COLUMN results_published BOOLEAN DEFAULT 0'))
-            db.session.commit()
-        if 'status' not in exam_columns:
-            db.session.execute(db.text("ALTER TABLE exam ADD COLUMN status VARCHAR(30) DEFAULT 'Draft'"))
-            db.session.commit()
-        course_columns = [row[1] for row in db.session.execute(db.text('PRAGMA table_info(course)')).fetchall()]
-        if 'course_code' not in course_columns:
-            db.session.execute(db.text("ALTER TABLE course ADD COLUMN course_code VARCHAR(50) DEFAULT ''"))
-            db.session.commit()
-        if 'status' not in course_columns:
-            db.session.execute(db.text("ALTER TABLE course ADD COLUMN status VARCHAR(20) DEFAULT 'Active'"))
-            db.session.commit()
-        if 'weightage' not in question_columns:
-            db.session.execute(db.text('ALTER TABLE question ADD COLUMN weightage INTEGER DEFAULT 0'))
-            db.session.commit()
-        slot_columns = [row[1] for row in db.session.execute(db.text('PRAGMA table_info(slot)')).fetchall()]
-        if 'end_time' not in slot_columns:
-            db.session.execute(db.text("ALTER TABLE slot ADD COLUMN end_time VARCHAR(20) DEFAULT ''"))
-            db.session.commit()
-        if 'meeting_link' not in slot_columns:
-            db.session.execute(db.text("ALTER TABLE slot ADD COLUMN meeting_link VARCHAR(200) DEFAULT ''"))
-            db.session.commit()
-        if 'status' not in slot_columns:
-            db.session.execute(db.text("ALTER TABLE slot ADD COLUMN status VARCHAR(20) DEFAULT 'Available'"))
-            db.session.commit()
-        booking_columns = [row[1] for row in db.session.execute(db.text('PRAGMA table_info(booking)')).fetchall()]
-        if 'booking_date' not in booking_columns:
-            db.session.execute(db.text("ALTER TABLE booking ADD COLUMN booking_date VARCHAR(30) DEFAULT ''"))
-            db.session.commit()
-        if 'status' not in booking_columns:
-            db.session.execute(db.text("ALTER TABLE booking ADD COLUMN status VARCHAR(20) DEFAULT 'Booked'"))
-            db.session.commit()
-        if 'assigned_examinor_id' not in booking_columns:
-            db.session.execute(db.text('ALTER TABLE booking ADD COLUMN assigned_examinor_id INTEGER'))
-            db.session.commit()
-        staff_columns = [row[1] for row in db.session.execute(db.text('PRAGMA table_info(staff__profile)')).fetchall()]
-        if staff_columns and 'department' not in staff_columns:
-            db.session.execute(db.text("ALTER TABLE staff__profile ADD COLUMN department VARCHAR(100) DEFAULT ''"))
-            db.session.commit()
         old_user = User.query.filter_by(email='admin@example.com').first()
         if not old_user:
             user = User(name='admin', email='admin@example.com', password='admin', role='admin')

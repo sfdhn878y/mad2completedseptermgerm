@@ -5,12 +5,6 @@
     <form @submit.prevent="save">
         <input type="text" v-model="exam.exam_name" placeholder="Exam Name">
         <input type="text" v-model="exam.exam_description" placeholder="Exam Description">
-        <select v-model="exam.exam_type">
-            <option value="Viva">Viva</option>
-            <option value="Practical">Practical</option>
-            <option value="Project Demo">Project Demo</option>
-            <option value="Assessment">Assessment</option>
-        </select>
         <input type="number" v-model="exam.duration" placeholder="Duration">
         <input type="number" v-model="exam.max_marks" placeholder="Maximum marks">
         <label>Slot start <input type="date" v-model="exam.examinor_slot_create_start_date"></label>

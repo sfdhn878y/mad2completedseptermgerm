@@ -3,14 +3,14 @@
     <div>
         <h1>Create Slot</h1>
         <p v-if="slot_open">Slot creation opened by admin</p>
-        <p v-else-if="slot_start">Allowed from {{ slot_start }} to {{ slot_end }}</p>
-        <p v-if="exam_start">Slot date must be between {{ exam_start }} and {{ exam_end }}</p>
+        <p v-else-if="slot_start">You can create slots from {{ slot_start }} to {{ slot_end }}</p>
+        <p v-if="exam_start">Give the slot on an examination date, from {{ exam_start }} to {{ exam_end }}</p>
         <p v-if="blocked_message">{{ blocked_message }}</p>
     </div>
     {{ responce_frontend }}
     <form v-if="!blocked_message" @submit.prevent="createSlot">
         <label>
-            Slot date
+            Examination date
             <input type="date" v-model="slot_date" :min="exam_start" :max="exam_end" required>
         </label>
         <label>
@@ -21,10 +21,7 @@
             End time
             <input type="time" v-model="end_time" required>
         </label>
-        <label>
-            Capacity
-            <input type="number" v-model="capacity" min="1" required>
-        </label>
+        <p>Capacity: 1</p>
         <input type="text" v-model="meeting_link" placeholder="Meeting link (optional)">
         <button type="submit">Create Slot</button>
     </form>
@@ -40,7 +37,6 @@ const examination_id = useRoute().params.examination_id
 const slot_date = ref('')
 const slot_time = ref('')
 const end_time = ref('')
-const capacity = ref(1)
 const meeting_link = ref('')
 const responce_frontend = ref('')
 const slot_start = ref('')
@@ -64,11 +60,12 @@ const load_exam = async () => {
         blocked_message.value = 'Examination not found'
         return
     }
-    slot_start.value = exam.examinor_slot_create_start_date
-    slot_end.value = exam.examinor_slot_create_end_date
-    exam_start.value = exam.exam_start_date
-    exam_end.value = exam.exam_end_date
-    slot_open.value = !!exam.slot_open
+    slot_start.value = String(exam.examinor_slot_create_start_date).slice(0, 10)
+    slot_end.value = String(exam.examinor_slot_create_end_date).slice(0, 10)
+    exam_start.value = String(exam.exam_start_date).slice(0, 10)
+    exam_end.value = String(exam.exam_end_date).slice(0, 10)
+    slot_date.value = exam_start.value
+    slot_open.value = !!exam.slot_open || exam.status === 'Slot Creation'
     const current = today()
     const in_window = current >= slot_start.value && current <= slot_end.value
     if (!slot_open.value && !in_window) {
@@ -82,14 +79,14 @@ const createSlot = async () => {
         return
     }
     if (slot_date.value < exam_start.value || slot_date.value > exam_end.value) {
-        responce_frontend.value = 'Slot date must be between the exam start date and the exam end date'
+        responce_frontend.value = 'Give the slot on an examination date, from ' + exam_start.value + ' to ' + exam_end.value
         return
     }
     const response = await axios.post(`http://127.0.0.1:5000/create_slot/${examination_id}`, {
         slot_date: slot_date.value,
         slot_time: slot_time.value,
         end_time: end_time.value,
-        capacity: capacity.value,
+        capacity: 1,
         meeting_link: meeting_link.value,
         examinor_id: localStorage.getItem('user_id')
     })

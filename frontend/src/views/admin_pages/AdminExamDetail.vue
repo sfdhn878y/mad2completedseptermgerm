@@ -48,7 +48,7 @@
                     <td>{{ slot.status }}</td>
                     <td>{{ slot.booked_by }}</td>
                     <td>
-                        <input type="date" v-model="slot.slot_date">
+                        <input type="date" v-model="slot.slot_date" :min="String(exam.exam_start_date).slice(0, 10)" :max="String(exam.exam_end_date).slice(0, 10)">
                         <input type="time" v-model="slot.slot_time">
                         <input type="time" v-model="slot.end_time">
                         <button @click="reschedule(slot)">Save</button>
@@ -107,6 +107,7 @@ const reschedule = async (slot) => {
         end_time: slot.end_time
     })
     message.value = response.data.message
+    getExamDetail()
 }
 
 onMounted(() => {

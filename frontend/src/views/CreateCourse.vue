@@ -18,15 +18,16 @@
 </template>
 <script setup>
 import Navbar from './components/Navbar.vue'
-import { -ref } from 'vue';
-const courseCode = ref('');
-const courseName = ref('');
-const courseDescription = ref('');
-const courseDuration = ref('');
-const status = ref('Active');
+import { ref } from 'vue'
+import axios from 'axios'
+
+const courseCode = ref('')
+const courseName = ref('')
+const courseDescription = ref('')
+const courseDuration = ref('')
+const status = ref('Active')
 const error = ref('')
 const responce_frontend = ref('')
-import axios from 'axios';
 
 const createCourse = async () => {
     try{

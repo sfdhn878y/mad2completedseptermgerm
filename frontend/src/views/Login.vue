@@ -53,7 +53,7 @@ const login = async () =>{
             }
         }
     }catch(err){
-        error.value = err.response.data.message
+        error.value = err.response && err.response.data ? err.response.data.message : 'Login failed'
     }
 }
 

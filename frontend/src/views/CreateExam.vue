@@ -6,12 +6,6 @@
     <form @submit.prevent="createExam">
         <input type="text" v-model="examName" placeholder="Exam Name">
         <input type="text" v-model="examDescription" placeholder="Exam Description">
-        <select v-model="examType">
-            <option value="Viva">Viva</option>
-            <option value="Practical">Practical</option>
-            <option value="Project Demo">Project Demo</option>
-            <option value="Assessment">Assessment</option>
-        </select>
         <input type="number" v-model="duration" placeholder="Duration in minutes">
         <input type="number" v-model="maxMarks" placeholder="Maximum marks">
         <label>

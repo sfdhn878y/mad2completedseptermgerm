@@ -65,7 +65,7 @@ const today = () => {
 }
 
 const can_create_slot = (examination) => {
-    if (examination.slot_open) {
+    if (examination.slot_open || examination.status === 'Slot Creation') {
         return true
     }
     const current = today()
