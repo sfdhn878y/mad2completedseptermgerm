@@ -33,6 +33,7 @@
   <a href="/create_examinor">Create examiner</a>
   <a href="/manage_students">Students</a>
   <a href="/manage_bookings">Bookings</a>
+  <a href="/all_slots">Examiner slots</a>
   <a href="/reports">Reports</a>
   <a href="/admin_search">Search</a>
 </div>

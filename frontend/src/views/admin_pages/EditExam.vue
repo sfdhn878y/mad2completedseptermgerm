@@ -11,8 +11,9 @@
         <label>Slot end <input type="date" v-model="exam.examinor_slot_create_end_date"></label>
         <label>Booking start <input type="date" v-model="exam.booking_start_time"></label>
         <label>Booking end <input type="date" v-model="exam.booking_end_time"></label>
-        <label>Exam start <input type="date" v-model="exam.exam_start_date"></label>
-        <label>Exam end <input type="date" v-model="exam.exam_end_date"></label>
+        <label>Exam start <input type="date" v-model="exam.exam_start_date" :disabled="dateLocked"></label>
+        <label>Exam end <input type="date" v-model="exam.exam_end_date" :disabled="dateLocked"></label>
+        <p v-if="dateLocked">Exam date cannot be changed after booking is closed or a booking has happened.</p>
         <select v-model="exam.course_id">
             <option v-for="course in courses" :key="course.id" :value="course.id">{{ course.name }}</option>
         </select>
@@ -37,6 +38,7 @@ import { useRoute } from 'vue-router'
 
 const examId = useRoute().params.examination_id
 const message = ref('')
+const dateLocked = ref(false)
 const courses = ref([])
 const examinors = ref([])
 const exam = ref({
@@ -75,6 +77,7 @@ const load = async () => {
         examinor_id: found.examinor_id,
         status: found.status
     }
+    dateLocked.value = Boolean(found.exam_date_locked)
     const courseResponse = await axios.post('http://127.0.0.1:5000/provide_course_details')
     courses.value = courseResponse.data.data
     const examinorResponse = await axios.get('http://127.0.0.1:5000/provide_examinor_details')

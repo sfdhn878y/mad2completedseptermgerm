@@ -47,7 +47,8 @@
                     <td>{{ slot.capacity }}</td>
                     <td>{{ slot.status }}</td>
                     <td>{{ slot.booked_by }}</td>
-                    <td>
+                    <td v-if="slot.evaluated">Marks given</td>
+                    <td v-else>
                         <input type="date" v-model="slot.slot_date" :min="String(exam.exam_start_date).slice(0, 10)" :max="String(exam.exam_end_date).slice(0, 10)">
                         <input type="time" v-model="slot.slot_time">
                         <input type="time" v-model="slot.end_time">

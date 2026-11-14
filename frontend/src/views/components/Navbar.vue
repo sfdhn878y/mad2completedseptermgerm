@@ -8,6 +8,7 @@
           <a href="/manage_course" >Courses</a>
           <a href="/manage_examination" >Examinations</a>
           <a href="/manage_examinor" >Examiners</a>
+          <a href="/all_slots" >Slots</a>
           <a href="/manage_students" >Students</a>
           <a href="/manage_bookings" >Bookings</a>
           <a href="/reports" >Reports</a>

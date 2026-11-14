@@ -26,6 +26,7 @@ import ExamDetail from '../views/user/ExamDetail.vue'
 import MyBooking from '../views/user/MyBooking.vue'
 import ManageStudents from '../views/admin_pages/ManageStudents.vue'
 import AllBookings from '../views/admin_pages/AllBookings.vue'
+import AllSlots from '../views/admin_pages/AllSlots.vue'
 import EditExam from '../views/admin_pages/EditExam.vue'
 import Reports from '../views/admin_pages/Reports.vue'
 import AdminSearch from '../views/admin_pages/AdminSearch.vue'
@@ -136,6 +137,10 @@ const routes = [
   {
     path: '/manage_bookings',
     component: AllBookings
+  },
+  {
+    path: '/all_slots',
+    component: AllSlots
   },
   {
     path: '/edit_exam/:examination_id',

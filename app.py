@@ -522,6 +522,19 @@ def exam_is_finished(exam):
         return False
     return date.today() > exam_end
 
+def exam_dates_locked(exam):
+    if not exam:
+        return False
+    if exam.status in ('Closed', 'Completed'):
+        return True
+    slot_ids = [slot.id for slot in Slot.query.filter_by(exam_id=exam.id).all()]
+    if not slot_ids:
+        return False
+    return Booking.query.filter(
+        Booking.slot_id.in_(slot_ids),
+        Booking.status != 'Cancelled'
+    ).count() > 0
+
 @app.route('/create_exam', methods=['POST'])
 def create_exam():
     data = request.json
@@ -644,7 +657,8 @@ def provide_examination_details():
                 'exam_type': examination.exam_type,
                 'duration': examination.duration,
                 'max_marks': examination.max_marks,
-                'status': examination.status
+                'status': examination.status,
+                'exam_date_locked': exam_dates_locked(examination)
             }
         )
     return jsonify({'data': all_examinations_list})
@@ -657,10 +671,15 @@ def admin_exam_detail(exam_id):
     slots = []
     for slot in Slot.query.filter_by(exam_id=exam_id).all():
         booked_names = []
+        evaluated = False
         for booking in Booking.query.filter_by(slot_id=slot.id).all():
             student = User.query.filter_by(id=booking.user_id).first()
             if student:
                 booked_names.append(student.name)
+            if Evaluation.query.filter_by(booking_id=booking.id).first() or Mark.query.filter_by(booking_id=booking.id).first():
+                evaluated = True
+                if booking.status == 'Booked':
+                    booking.status = 'Evaluated'
         slots.append({
             'id': slot.id,
             'slot_date': slot.slot_date,
@@ -669,8 +688,10 @@ def admin_exam_detail(exam_id):
             'capacity': slot.capacity,
             'meeting_link': slot.meeting_link,
             'status': slot.status,
-            'booked_by': ', '.join(booked_names)
+            'booked_by': ', '.join(booked_names),
+            'evaluated': evaluated
         })
+    db.session.commit()
     return jsonify({'data': {
         'id': exam.id,
         'name': exam.exam_name,
@@ -1172,6 +1193,8 @@ def give_marks(booking_id):
         evaluation.examinor_id = examinor_id
     else:
         db.session.add(Evaluation(booking_id=booking.id, student_id=booking.user_id, examinor_id=examinor_id, total_marks=total, remarks=data['remarks'], evaluation_date=str(date.today()), status='Submitted'))
+    if booking.status == 'Booked':
+        booking.status = 'Evaluated'
     db.session.commit()
     return jsonify({'message': 'Marks saved successfully'})
 
@@ -1203,9 +1226,21 @@ def edit_exam(exam_id):
     exam.examinor_slot_create_end_date = data['examinor_slot_create_end_date']
     exam.booking_start_time = data['booking_start_time']
     exam.booking_end_time = data['booking_end_time']
+    new_start = str(data['exam_start_date'])[:10]
+    new_end = str(data['exam_end_date'])[:10]
+    old_start = str(exam.exam_start_date)[:10]
+    old_end = str(exam.exam_end_date)[:10]
+    if exam_dates_locked(exam) and (new_start != old_start or new_end != old_end):
+        db.session.rollback()
+        return jsonify({'message': 'Exam date cannot be changed after booking is closed or a booking has happened'})
     exam.exam_start_date = data['exam_start_date']
     exam.exam_end_date = data['exam_end_date']
     exam.course_id = data['course_id']
+    if str(data['examinor_id']) != str(exam.examinor_id):
+        conflict = examiner_time_conflict(exam, data['examinor_id'])
+        if conflict:
+            db.session.rollback()
+            return jsonify({'message': conflict})
     exam.examinor_id = data['examinor_id']
     exam.status = data['status']
     if data['status'] == 'Slot Creation':
@@ -1263,10 +1298,42 @@ def publish_results(exam_id):
     db.session.commit()
     return jsonify({'message': 'Results published'})
 
+def examiner_time_conflict(exam, examinor_id):
+    new_id = int(examinor_id)
+    if int(exam.examinor_id) == new_id:
+        return None
+    exam_slots = [slot for slot in Slot.query.filter_by(exam_id=exam.id).all() if slot.status != 'Cancelled']
+    for slot in exam_slots:
+        start, end = slot_time_range(slot.slot_time, slot.end_time, exam.duration)
+        for other in Slot.query.all():
+            if other.id == slot.id or other.exam_id == exam.id or other.status == 'Cancelled':
+                continue
+            if str(other.slot_date)[:10] != str(slot.slot_date)[:10]:
+                continue
+            owns_slot = int(other.examinor_id) == new_id
+            if not owns_slot:
+                for booking in Booking.query.filter_by(slot_id=other.id).all():
+                    if booking.status != 'Cancelled' and booking.assigned_examinor_id and int(booking.assigned_examinor_id) == new_id:
+                        owns_slot = True
+                        break
+            if not owns_slot:
+                continue
+            other_exam = Exam.query.filter_by(id=other.exam_id).first()
+            duration = other_exam.duration if other_exam else 30
+            other_start, other_end = slot_time_range(other.slot_time, other.end_time, duration)
+            if times_overlap(start, end, other_start, other_end):
+                person = User.query.filter_by(id=new_id).first()
+                name = person.name if person else 'This examiner'
+                return name + ' is not free on ' + str(slot.slot_date)[:10] + ' at ' + str(slot.slot_time)
+    return None
+
 @app.route('/change_exam_examiner/<int:exam_id>', methods=['POST'])
 def change_exam_examiner(exam_id):
     data = request.json
     exam = Exam.query.filter_by(id=exam_id).first()
+    conflict = examiner_time_conflict(exam, data['examinor_id'])
+    if conflict:
+        return jsonify({'message': conflict})
     old_id = exam.examinor_id
     exam.examinor_id = data['examinor_id']
     for slot in Slot.query.filter_by(exam_id=exam_id).all():
@@ -1335,6 +1402,11 @@ def reschedule_slot(slot_id):
     slot = Slot.query.filter_by(id=slot_id).first()
     if not slot:
         return jsonify({'message': 'Slot not found'})
+    for booking in Booking.query.filter_by(slot_id=slot.id).all():
+        if booking.status == 'Cancelled':
+            continue
+        if Evaluation.query.filter_by(booking_id=booking.id).first() or Mark.query.filter_by(booking_id=booking.id).first():
+            return jsonify({'message': 'Marks have already been given, so this slot cannot be rescheduled'})
     exam = Exam.query.filter_by(id=slot.exam_id).first()
     slot_date = date.fromisoformat(str(data['slot_date'])[:10])
     exam_start = date.fromisoformat(str(exam.exam_start_date)[:10])
@@ -1404,6 +1476,9 @@ def all_bookings():
         student = User.query.filter_by(id=booking.user_id).first()
         examinor_id = booking.assigned_examinor_id if booking.assigned_examinor_id else (slot.examinor_id if slot else None)
         examinor = User.query.filter_by(id=examinor_id).first()
+        evaluated = Evaluation.query.filter_by(booking_id=booking.id).first() is not None or Mark.query.filter_by(booking_id=booking.id).first() is not None
+        if evaluated and booking.status == 'Booked':
+            booking.status = 'Evaluated'
         rows.append({
             'id': booking.id,
             'student_name': student.name if student else '',
@@ -1419,8 +1494,10 @@ def all_bookings():
             'status': booking.status,
             'booking_date': booking.booking_date,
             'examinor_id': examinor_id,
-            'examinor_name': examinor.name if examinor else ''
+            'examinor_name': examinor.name if examinor else '',
+            'evaluated': evaluated
         })
+    db.session.commit()
     slots = []
     for slot in Slot.query.all():
         slots.append({'id': slot.id, 'exam_id': slot.exam_id, 'slot_date': slot.slot_date, 'slot_time': slot.slot_time})
@@ -1428,6 +1505,35 @@ def all_bookings():
     for user in User.query.filter_by(role='examinor').all():
         examinors.append({'id': user.id, 'name': user.name})
     return jsonify({'data': rows, 'slots': slots, 'examinors': examinors})
+
+@app.route('/all_examiner_slots', methods=['GET', 'POST'])
+def all_examiner_slots():
+    rows = []
+    for slot in Slot.query.all():
+        exam = Exam.query.filter_by(id=slot.exam_id).first()
+        examinor = User.query.filter_by(id=slot.examinor_id).first()
+        taken_bookings = Booking.query.filter(Booking.slot_id == slot.id, Booking.status != 'Cancelled').all()
+        booked_names = []
+        for booking in taken_bookings:
+            student = User.query.filter_by(id=booking.user_id).first()
+            if student:
+                booked_names.append(student.name)
+        rows.append({
+            'id': slot.id,
+            'exam_id': slot.exam_id,
+            'exam_name': exam.exam_name if exam else '',
+            'examinor_id': slot.examinor_id,
+            'examinor_name': examinor.name if examinor else '',
+            'slot_date': slot.slot_date,
+            'slot_time': slot.slot_time,
+            'end_time': slot.end_time,
+            'capacity': slot.capacity,
+            'available': slot.capacity - len(taken_bookings),
+            'meeting_link': slot.meeting_link,
+            'status': slot.status,
+            'booked_by': ', '.join(booked_names)
+        })
+    return jsonify({'data': rows})
 
 @app.route('/admin_search', methods=['POST'])
 def admin_search():
