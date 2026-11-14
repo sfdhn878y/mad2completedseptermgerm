@@ -1,4 +1,6 @@
-
+from datetime import datetime, date, timedelta
+from celery.schedules import crontab
+from flask_mail import Mail, Message
 import csv
 import jwt
 import os
@@ -17,6 +19,9 @@ CORS(app)
 app.config['CACHE_TYPE'] = 'RedisCache'
 app.config['CACHE_REDIS_URL'] = 'redis://localhost:6379/1'
 cache = Cache(app)
+
+
+
 def make_celery(app):
     celery_app = Celery(
         app.import_name,
@@ -24,6 +29,18 @@ def make_celery(app):
         backend='redis://localhost:6379/0'
     )
     celery_app.conf.update(app.config)
+    celery_app.conf.timezone = "Asia/Kolkata"
+    celery_app.conf.enable_utc = False
+    celery_app.conf.beat_schedule = {
+        "daily-examination-reminder": {
+            "task": "app.send_examination_reminders",
+            "schedule": timedelta(seconds=10),
+        },
+        "monthly-examination-report": {
+    "task": "app.send_monthly_examination_report",
+    "schedule": timedelta(seconds=10),
+},
+    }
     class ContextTask(celery_app.Task):
         def __call__(self, *args, **kwargs):
             with app.app_context():
@@ -31,6 +48,16 @@ def make_celery(app):
     celery_app.Task = ContextTask
     return celery_app
 celery = make_celery(app)
+
+app.config["MAIL_SERVER"] = "smtp.gmail.com"
+app.config["MAIL_PORT"] = 587
+app.config["MAIL_USE_TLS"] = True
+app.config["MAIL_USERNAME"] = "lazyiitians17@gmail.com"
+app.config["MAIL_PASSWORD"] = os.environ.get("MAIL_PASSWORD", "")
+app.config["MAIL_DEFAULT_SENDER"] = "lazyiitians17@gmail.com"
+mail = Mail(app)
+
+
 
 class User(db.Model):
     id = db.Column(db.Integer,primary_key=True)
@@ -153,9 +180,40 @@ class Alert(db.Model):
     is_read = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.String(30), nullable=False, default='')
 
+@celery.task(name="app.send_examination_reminders")
+def send_examination_reminders():
+    sent = 0
 
+    bookings = Booking.query.filter_by(status="Booked").all()
+    for booking in bookings:
+        slot = Slot.query.filter_by(id=booking.slot_id).first()
+        if not slot:
+            continue
 
+        student = User.query.filter_by(id=booking.user_id).first()
+        exam = Exam.query.filter_by(id=slot.exam_id).first()
+        if not student or not student.email or not exam:
+            continue
 
+        examiner_id = booking.assigned_examinor_id or slot.examinor_id or exam.examinor_id
+        examiner = User.query.filter_by(id=examiner_id).first() if examiner_id else None
+
+        msg = Message(
+            subject=f"Reminder: {exam.exam_name}",
+            recipients=[student.email],
+            body=(
+                f"Hi {student.name},\n\n"
+                f"Examination: {exam.exam_name}\n"
+                f"Date: {slot.slot_date}\n"
+                f"Time: {slot.slot_time}\n"
+                f"Examiner: {examiner.name if examiner else 'Not assigned'}\n"
+                f"Instructions: {exam.exam_description}\n"
+            ),
+        )
+        mail.send(msg)
+        sent += 1
+
+    return f"Sent {sent} examination reminder(s)"
 
 EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'exports')
 CSV_FIELDS = [
@@ -275,7 +333,60 @@ def my_alerts():
             'is_read': alert.is_read
         })
     return jsonify({'data': alerts})
+@celery.task(name="app.send_monthly_examination_report")
+def send_monthly_examination_report():
+    exams = Exam.query.filter(Exam.status.in_(["Closed", "Completed"])).all()
+    bookings = Booking.query.all()
+    evaluations = Evaluation.query.all()
 
+    evaluated_students = {item.student_id for item in evaluations}
+    evaluated_booking_ids = {item.booking_id for item in evaluations}
+    completed_bookings = [item for item in bookings if item.id in evaluated_booking_ids]
+    pending = [
+        item for item in bookings
+        if item.status == "Booked" and item.id not in evaluated_booking_ids
+    ]
+
+    examiner_counts = {}
+    for item in evaluations:
+        examiner_counts[item.examinor_id] = examiner_counts.get(item.examinor_id, 0) + 1
+    active = sorted(examiner_counts.items(), key=lambda pair: pair[1], reverse=True)[:5]
+
+    if active:
+        rows = ""
+        for examiner_id, count in active:
+            examiner = User.query.filter_by(id=examiner_id).first()
+            name = examiner.name if examiner else "Unknown"
+            rows += f"<li>{name} — {count} evaluation(s)</li>"
+    else:
+        rows = "<li>No evaluations yet</li>"
+
+    html_body = f"""
+    <h2>Monthly examination report</h2>
+    <ul>
+        <li><strong>Examinations conducted:</strong> {len(exams)}</li>
+        <li><strong>Students evaluated:</strong> {len(evaluated_students)}</li>
+        <li><strong>Completed bookings:</strong> {len(completed_bookings)}</li>
+        <li><strong>Pending evaluations:</strong> {len(pending)}</li>
+    </ul>
+    <h3>Most active examiners</h3>
+    <ul>{rows}</ul>
+    """
+
+    admins = User.query.filter_by(role="admin").all()
+    sent = 0
+    for admin in admins:
+        if not admin.email:
+            continue
+        msg = Message(
+            subject="Monthly examination report",
+            recipients=[admin.email],
+            html=html_body,
+        )
+        mail.send(msg)
+        sent += 1
+
+    return f"Monthly report sent to {sent} admin(s)"
 @app.route('/register',methods=['POST'])
 def register():
     data = request.json
